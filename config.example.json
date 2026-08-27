@@ -1,0 +1,7 @@
+{
+  "SPOTIPY_CLIENT_ID": "ใส่ Client ID ของคุณที่นี่",
+  "SPOTIPY_CLIENT_SECRET": "ใส่ Client Secret ของคุณที่นี่",
+  "output_dir": "~/Music/SpotifyDL",
+  "bitrate": "320",
+  "user_auth": true
+}
