@@ -52,6 +52,17 @@ if _is_worker:
     _args = [a for a in sys.argv[1:]
              if a != WORKER_FLAG and not a.startswith("-psn_")]
     sys.argv = ["zotify"] + _args
+
+    # บังคับให้ stdout/stderr ส่งออกทีละบรรทัดทันที
+    # สำคัญมาก: ตอนล็อกอิน zotify พิมพ์ URL แล้ว "ค้างรอ callback" ทันที
+    # ถ้า buffer เป็นบล็อก URL จะไม่เคยถูกส่งออกมา -> GUI ไม่เห็นลิงก์ -> ล็อกอินไม่สำเร็จ
+    # (PYTHONUNBUFFERED ไม่มีผลกับแอปที่ freeze แล้ว จึงต้องสั่งตรงนี้)
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(line_buffering=True, write_through=True)
+        except Exception:
+            pass
+
     try:
         from zotify.__main__ import main as _zotify_main
     except Exception as _e:
@@ -227,6 +238,40 @@ def probe_zotify(zotify_cmd: list | None) -> dict:
 OAUTH_URL_RE = re.compile(r"https://accounts\.spotify\.com/\S+")
 
 
+OAUTH_PORT = 4381  # port ที่ librespot ใช้รับ callback ตอนล็อกอิน
+
+
+def oauth_port_holder() -> str | None:
+    """
+    ถ้า port 4381 ถูกยึดอยู่ คืนคำอธิบายว่าใครยึด (ไม่ยึด = None).
+    ป้องกัน error 'Address already in use' ตอนล็อกอิน ซึ่งมักเกิดจาก
+    โปรเซส zotify/แอปเก่าที่ยังไม่ตาย
+    """
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", OAUTH_PORT))
+        return None          # bind ได้ = ว่าง
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+    # หา PID ที่ยึดอยู่ (macOS/Linux)
+    try:
+        r = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{OAUTH_PORT}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=10,
+        )
+        lines = [l for l in r.stdout.splitlines()[1:] if l.strip()]
+        if lines:
+            parts = lines[0].split()
+            return f"{parts[0]} (PID {parts[1]})"
+    except Exception:
+        pass
+    return "ไม่ทราบโปรเซส"
+
+
 def zotify_credentials_path() -> Path:
     """ที่เก็บ credentials.json ของ zotify ตามระบบปฏิบัติการ."""
     if sys.platform == "win32":
@@ -261,6 +306,10 @@ class App(tk.Tk):
         self.msg_q: queue.Queue = queue.Queue()
         self.zotify_cmd = detect_zotify()
         self.info = {"version": None, "origin": None, "fork": "unknown"}
+        self._saw_output = False
+        self._oauth_opened = False
+        self._oauth_url = None
+        self._cred_mtime_before = None
 
         self._build_ui()
         self.after(100, self._drain)
@@ -497,6 +546,25 @@ class App(tk.Tk):
             messagebox.showerror("ไม่พบ zotify", "ยังไม่พบ zotify — ติดตั้งก่อน หรือระบุ path")
             return
 
+        # ตรวจ port ก่อน — ถ้าถูกยึดอยู่ ล็อกอินจะพังด้วย "Address already in use"
+        holder = oauth_port_holder()
+        if holder:
+            if messagebox.askyesno(
+                "Port ถูกใช้งานอยู่",
+                f"port {OAUTH_PORT} (ใช้รับ callback ตอนล็อกอิน) ถูกยึดโดย:\n{holder}\n\n"
+                "มักเป็นโปรเซส zotify/แอปเก่าที่ค้างอยู่ ถ้าไม่ปิดก่อน ล็อกอินจะไม่สำเร็จ\n\n"
+                "ให้ปิดโปรเซสนั้นเลยไหม?",
+            ):
+                self._free_oauth_port()
+                holder = oauth_port_holder()
+                if holder:
+                    self.log(f"⚠ port {OAUTH_PORT} ยังถูกยึดโดย {holder}")
+                    self.log(f"  ปิดเองด้วย: lsof -nP -iTCP:{OAUTH_PORT} -sTCP:LISTEN  แล้ว kill -9 <PID>")
+                    return
+                self.log(f"✓ ปลด port {OAUTH_PORT} เรียบร้อย")
+            else:
+                return
+
         cred = zotify_credentials_path()
         if cred.exists():
             if not messagebox.askyesno(
@@ -508,20 +576,88 @@ class App(tk.Tk):
                 return
 
         self._oauth_opened = False
+        self._oauth_url = None
+        # จำเวลาแก้ไขไฟล์ credentials ไว้ก่อน เพื่อพิสูจน์ว่ารอบนี้ล็อกอินใหม่จริง
+        self._cred_mtime_before = cred.stat().st_mtime if cred.exists() else None
         tmpdir = tempfile.mkdtemp(prefix="zg_login_")
         args = [
             "-v",                                  # verify-library: ไม่ดาวน์โหลด
             "--root-path", tmpdir,                 # โฟลเดอร์ว่าง -> ไม่มีอะไรให้ตรวจ
             "--disable-song-archive", "True",      # ไม่ไปอ่าน archive เดิม
             "--print-splash", "False",
+            # สำคัญ: ปิด retry ของ zotify
+            # ลูป retry ใน boot() เรียก login() ใหม่โดยไม่ปิด callback server ตัวเก่า
+            # รอบสองจึง bind port 4381 ไม่ได้ -> Errno 48 มาบดบัง error จริง
+            "--retry-attempts", "0",
         ]
         cmd = list(self.zotify_cmd) + args
 
         self.log("\n=== ล็อกอิน Spotify ===")
         self.log("กำลังขอลิงก์ล็อกอิน… เบราว์เซอร์จะเปิดให้อัตโนมัติ")
         self.log("ถ้าไม่เปิดเอง ให้ก๊อปลิงก์ที่ขึ้นด้านล่างไปวางในเบราว์เซอร์")
+        self._login_done = False
         self._begin_run(stoppable=True)
         threading.Thread(target=self._run, args=(cmd, "login"), daemon=True).start()
+        threading.Thread(target=self._watch_credentials, args=(cred,), daemon=True).start()
+
+    def _watch_credentials(self, cred: Path, timeout: float = 300.0):
+        """
+        เฝ้าดูไฟล์ credentials — พอถูกเขียนแล้วถือว่าล็อกอินสำเร็จ แล้วปิดโปรเซสทันที
+
+        เหตุผล: boot() ของ zotify เรียก login() ซ้ำรอบสอง (ลูป retry ไม่มี break)
+        แล้วยังไปทำ verify-library ต่ออีก ซึ่งเราไม่ต้องการ — รอจนจบอาจค้างนาน
+        """
+        import time as _t
+        before = self._cred_mtime_before
+        deadline = _t.time() + timeout
+        while _t.time() < deadline:
+            if not self._busy():
+                return                      # โปรเซสจบเองแล้ว ปล่อยให้ _run รายงาน
+            try:
+                if cred.exists():
+                    now = cred.stat().st_mtime
+                    if now != before:
+                        _t.sleep(1.5)       # รอให้เขียนไฟล์เสร็จสมบูรณ์
+                        self._login_done = True
+                        self.log("\n✓ ล็อกอินสำเร็จ — บันทึกข้อมูลเรียบร้อย")
+                        self.log(f"  ไฟล์: {cred}")
+                        self.log("  กำลังปิดขั้นตอนล็อกอิน…")
+                        self.after(0, self.stop)
+                        self.after(0, self._apply_info)
+                        return
+            except Exception:
+                pass
+            _t.sleep(0.5)
+
+    def _free_oauth_port(self):
+        """ปิดโปรเซสที่ยึด port ล็อกอินอยู่."""
+        import signal
+        try:
+            r = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{OAUTH_PORT}", "-sTCP:LISTEN", "-t"],
+                capture_output=True, text=True, timeout=10,
+            )
+            pids = [int(p) for p in r.stdout.split() if p.strip().isdigit()]
+        except Exception as e:
+            self.log(f"หา PID ไม่สำเร็จ: {e}")
+            return
+        me = os.getpid()
+        for pid in pids:
+            if pid == me:
+                continue
+            for sig, name in ((signal.SIGTERM, "TERM"), (signal.SIGKILL, "KILL")):
+                try:
+                    os.kill(pid, sig)
+                    self.log(f"  ส่ง SIG{name} ไปที่ PID {pid}")
+                except ProcessLookupError:
+                    break
+                except PermissionError:
+                    self.log(f"  ไม่มีสิทธิ์ปิด PID {pid}")
+                    break
+                import time as _t
+                _t.sleep(0.6)
+                if oauth_port_holder() is None:
+                    return
 
     def _maybe_open_oauth(self, line: str):
         """ดัก URL ล็อกอินจาก log แล้วเปิดเบราว์เซอร์ให้ (ครั้งเดียว)."""
@@ -609,8 +745,9 @@ class App(tk.Tk):
     def _run(self, cmd: list, mode: str = "download"):
         try:
             env = dict(os.environ, PYTHONUNBUFFERED="1")
-            if mode == "download" and FROZEN:
-                # สั่งให้ลูกเข้าโหมด worker ผ่าน env — เชื่อถือได้กว่า argv
+            if FROZEN and mode in ("download", "login"):
+                # ทุกโหมดที่รัน zotify ต้องสั่งให้ลูกเข้า worker ผ่าน env
+                # (ถ้าลืมโหมดใดโหมดหนึ่ง ลูกจะไปเปิดหน้าต่าง GUI ซ้ำแทน)
                 env[WORKER_ENV] = "1"
             else:
                 # ห้ามให้ลูก (เช่น pip) หลุดเข้าโหมด worker โดยไม่ตั้งใจ
@@ -619,25 +756,85 @@ class App(tk.Tk):
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, text=True, bufsize=1, env=env,
             )
-            for line in self.proc.stdout:
-                line = line.rstrip("\n")
+            self._saw_output = False
+            # อ่านทีละก้อนแล้วแยกทั้ง \n และ \r
+            # (zotify ใช้ \r วาด spinner — ถ้าแยกแค่ \n จะค้างไม่แสดงผล)
+            buf = ""
+            while True:
+                chunk = self.proc.stdout.read(1)
+                if not chunk:
+                    break
+                if chunk in ("\n", "\r"):
+                    line, buf = buf, ""
+                else:
+                    buf += chunk
+                    continue
+                if not line.strip():
+                    continue
+                self._saw_output = True
+                # spinner ของ zotify วาดซ้ำด้วย \r — ตัดเฟรมที่ข้อความเหมือนเดิมออก
+                # ไม่งั้น log จะถูกถล่มด้วย "[●∙∙] Logging in..." นับร้อยบรรทัด
+                stripped = re.sub(r"[\[\]●∙•◦\s]+", " ", line).strip()
+                if stripped and stripped == getattr(self, "_last_spin", None):
+                    continue
+                self._last_spin = stripped
                 self.log(line)
                 if mode == "login":
                     self._maybe_open_oauth(line)
+                if "Address already in use" in line or "Errno 48" in line:
+                    self.log(f"\n⚠ port {OAUTH_PORT} ถูกยึดอยู่ — ล็อกอินไม่สำเร็จ")
+                    self.log(f"  ดูว่าใครยึด: lsof -nP -iTCP:{OAUTH_PORT} -sTCP:LISTEN")
+                    self.log(f"  ปิดทิ้ง:     kill -9 $(lsof -nP -iTCP:{OAUTH_PORT} -sTCP:LISTEN -t)")
+                if "LOGIN FAILED (54)" in line or "LOGIN FAILED (104)" in line:
+                    self.log("\n⚠ การเชื่อมต่อถูกรีเซ็ต (connection reset) ระหว่างล็อกอิน")
+                    self.log("  มักเกิดจากเน็ต/ไฟร์วอลล์/VPN บล็อกการเชื่อมต่อไปยัง Spotify")
+                    self.log("  ลองปิด VPN/proxy แล้วลองใหม่")
+
+            # เศษบรรทัดสุดท้ายที่ไม่มี \n ปิดท้าย (URL อาจค้างอยู่ตรงนี้)
+            if buf.strip():
+                self._saw_output = True
+                self.log(buf)
+                if mode == "login":
+                    self._maybe_open_oauth(buf)
+
             self.proc.wait()
             rc = self.proc.returncode
 
             if mode == "login":
+                if getattr(self, "_login_done", False):
+                    # watcher รายงานสำเร็จและสั่งปิดโปรเซสไปแล้ว
+                    self.log("  ตอนนี้กด 'เริ่มดาวน์โหลด' ได้เลย ไม่ต้องล็อกอินอีก")
+                    self.after(0, self._apply_info)
+                    return
                 cred = zotify_credentials_path()
-                if cred.exists():
+                before = getattr(self, "_cred_mtime_before", None)
+                now = cred.stat().st_mtime if cred.exists() else None
+                changed = now is not None and now != before
+
+                if changed:
                     self.log(f"\n✓ ล็อกอินสำเร็จ — บันทึกไว้ที่ {cred}")
                     self.log("  ตอนนี้กด 'เริ่มดาวน์โหลด' ได้เลย ไม่ต้องล็อกอินอีก")
-                else:
-                    self.log("\n✗ ยังไม่พบไฟล์ credentials — ล็อกอินอาจไม่สำเร็จ")
-                    if getattr(self, "_oauth_url", None):
-                        self.log(f"  ลองเปิดลิงก์นี้เองอีกครั้ง:\n  {self._oauth_url}")
+                elif now is not None:
+                    # ไฟล์มีอยู่แต่ไม่ถูกเขียนใหม่ = ใช้ credentials เดิมผ่านได้ หรือรอบนี้ไม่ได้ทำอะไร
+                    if self._saw_output:
+                        self.log(f"\n✓ ใช้ข้อมูลล็อกอินเดิมได้ (ไม่ต้องล็อกอินใหม่)")
+                        self.log(f"  ไฟล์: {cred}")
                     else:
-                        self.log("  ไม่พบลิงก์ล็อกอินใน log — ลองรัน zotify ในเทอร์มินัลดูข้อความเต็ม")
+                        self.log("\n⚠ ไม่แน่ใจว่าล็อกอินสำเร็จ — zotify ไม่ได้ส่งข้อความอะไรกลับมาเลย")
+                        self.log("  ลองรัน zotify ในเทอร์มินัลเพื่อดูข้อความเต็ม")
+                else:
+                    self.log("\n✗ ยังไม่พบไฟล์ credentials — ล็อกอินไม่สำเร็จ")
+                    if self._oauth_url:
+                        self.log(f"  ลองเปิดลิงก์นี้เองอีกครั้ง:\n  {self._oauth_url}")
+                    elif not self._saw_output:
+                        self.log("  zotify ไม่ส่งข้อความกลับมาเลย แปลว่าโปรเซสลูกไม่ได้รัน zotify")
+                        self.log("  → ถ้ายังไม่ได้ build ใหม่หลังแก้ล่าสุด ให้รัน ./build_macos.sh ก่อน")
+                    else:
+                        self.log("  zotify ทำงานแต่ไม่พิมพ์ลิงก์ออกมา")
+                        self.log("  → อาจล็อกอินผ่าน credentials เดิมแล้วล้มเหลวภายหลัง")
+                        self.log("  → ลองรันในเทอร์มินัลเพื่อดูข้อความเต็ม:")
+                        self.log("     zotify <ลิงก์เพลง> --download-quality very_high")
+                self.after(0, self._apply_info)   # รีเฟรชสถานะล็อกอินบนหน้าจอ
                 return
 
             self.log(f"[เสร็จสิ้น] exit code = {rc}")
@@ -665,12 +862,36 @@ class App(tk.Tk):
         self.spinner.stop()
 
     def stop(self):
-        if self._busy():
+        """หยุดโปรเซสลูก — ถ้าไม่ยอมตายใน 3 วินาที บังคับ kill
+        (สำคัญ: โปรเซสที่ค้างจะยึด port 4381 ทำให้ล็อกอินครั้งต่อไปพัง)"""
+        if not self._busy():
+            return
+        self.log("\n[ยกเลิก] ส่งสัญญาณหยุด…")
+        try:
             self.proc.terminate()
-            self.log("\n[ยกเลิก] ส่งสัญญาณหยุดแล้ว")
+        except Exception:
+            return
+
+        def ensure_dead(p):
+            try:
+                p.wait(timeout=3)
+                self.log("[ยกเลิก] หยุดเรียบร้อย")
+            except Exception:
+                try:
+                    p.kill()
+                    self.log("[ยกเลิก] ไม่ตอบสนอง — บังคับปิดแล้ว")
+                except Exception as e:
+                    self.log(f"[ยกเลิก] ปิดไม่สำเร็จ: {e}")
+
+        threading.Thread(target=ensure_dead, args=(self.proc,), daemon=True).start()
 
 
 def main():
+    # กันชน: ถ้าถูกสั่งให้เป็น worker แต่หลุดมาถึงตรงนี้ ห้ามเปิดหน้าต่าง GUI ซ้ำ
+    # (worker branch ด้านบนควรดักไปแล้ว — ถ้ามาถึงนี่แปลว่า import zotify พัง)
+    if os.environ.get(WORKER_ENV) == "1":
+        print("[worker] ไม่สามารถเข้าโหมด worker ได้ และจะไม่เปิด GUI ซ้ำ", flush=True)
+        sys.exit(3)
     App().mainloop()
 
 
