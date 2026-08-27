@@ -22,12 +22,15 @@ GUI จะอ่าน direct_url.json ของ package เพื่อรู�
 from __future__ import annotations
 
 import os
+import re
 import sys
 import json
 import shutil
+import tempfile
 import subprocess
 import threading
 import queue
+import webbrowser
 from pathlib import Path
 
 # ==================================================================
@@ -220,6 +223,21 @@ def probe_zotify(zotify_cmd: list | None) -> dict:
     return out
 
 
+# URL ที่ zotify พิมพ์ออกมาตอนขอ OAuth (จะดักไปเปิดเบราว์เซอร์ให้อัตโนมัติ)
+OAUTH_URL_RE = re.compile(r"https://accounts\.spotify\.com/\S+")
+
+
+def zotify_credentials_path() -> Path:
+    """ที่เก็บ credentials.json ของ zotify ตามระบบปฏิบัติการ."""
+    if sys.platform == "win32":
+        base = Path.home() / "AppData/Roaming/Zotify"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library/Application Support/Zotify"
+    else:
+        base = Path.home() / ".local/share/zotify"
+    return base / "credentials.json"
+
+
 def origin_to_pip_url(origin: str | None, fork: str) -> str:
     """แปลง origin url -> รูปแบบที่ pip ติดตั้งได้ (git+...git)."""
     if origin:
@@ -323,6 +341,8 @@ class App(tk.Tk):
         self.login_hint.pack(anchor="w", padx=8, pady=2)
 
         act = ttk.Frame(self); act.pack(fill="x", **pad)
+        self.login_btn = ttk.Button(act, text="🔑 ล็อกอิน Spotify", command=self.do_login)
+        self.login_btn.pack(side="left", padx=6)
         self.run_btn = ttk.Button(act, text="⬇  เริ่มดาวน์โหลด", command=self.start)
         self.run_btn.pack(side="left", padx=6)
         self.stop_btn = ttk.Button(act, text="■ หยุด", command=self.stop, state="disabled")
@@ -381,12 +401,16 @@ class App(tk.Tk):
             self.upgrade_btn.config(state="disabled")
             self.cmd_entry.config(state="disabled")
         # ปรับ UI ตาม fork
+        cred_exists = zotify_credentials_path().exists()
+        status = "✓ ล็อกอินแล้ว" if cred_exists else "ยังไม่ได้ล็อกอิน — กดปุ่ม 🔑 ล็อกอิน Spotify"
         if self.info["fork"] == "googolplexed":
-            self.login_hint.config(text="fork นี้ใช้ OAuth (เปิดเบราว์เซอร์ตอนล็อกอิน) — ไม่ใช้ password. ช่อง Password จะถูกปิด")
+            self.login_hint.config(
+                text=f"{status}  |  fork นี้ใช้ OAuth ผ่านเบราว์เซอร์ ไม่ใช้ password "
+                     "(ช่องด้านบนไม่จำเป็น เว้นว่างได้)")
             self.pass_entry.config(state="disabled")
             self.realtime_var.set(False)
         else:
-            self.login_hint.config(text="ทิ้งว่างได้ถ้าเคยล็อกอินแล้ว")
+            self.login_hint.config(text=f"{status}  |  ทิ้งว่างได้ถ้าเคยล็อกอินแล้ว")
             self.pass_entry.config(state="normal")
 
     def recheck(self):
@@ -458,6 +482,63 @@ class App(tk.Tk):
         self._begin_run(stoppable=True)
         threading.Thread(target=self._run, args=(cmd, "download"), daemon=True).start()
 
+    # ---------------- login ----------------
+    def do_login(self):
+        """
+        ล็อกอิน Spotify ผ่านเบราว์เซอร์.
+
+        กลไก: zotify ทำ login ใน boot() ก่อนเริ่มงานเสมอ เราจึงสั่ง verify-library
+        (-v) ชี้ไปโฟลเดอร์ว่างชั่วคราว -> มันจะล็อกอินแล้วจบทันที ไม่ดาวน์โหลดอะไร
+        ระหว่างนั้น zotify จะพิมพ์ URL ของ Spotify ออกมา เราดักแล้วเปิดเบราว์เซอร์ให้
+        """
+        if self._busy():
+            return
+        if not self.zotify_cmd:
+            messagebox.showerror("ไม่พบ zotify", "ยังไม่พบ zotify — ติดตั้งก่อน หรือระบุ path")
+            return
+
+        cred = zotify_credentials_path()
+        if cred.exists():
+            if not messagebox.askyesno(
+                "ล็อกอินใหม่?",
+                f"พบข้อมูลล็อกอินเดิมอยู่แล้วที่:\n{cred}\n\n"
+                "ปกติไม่ต้องล็อกอินซ้ำ — จะล็อกอินใหม่เลยไหม?\n"
+                "(ถ้าเจอปัญหา session ถูกยกเลิก ให้ตอบ Yes)",
+            ):
+                return
+
+        self._oauth_opened = False
+        tmpdir = tempfile.mkdtemp(prefix="zg_login_")
+        args = [
+            "-v",                                  # verify-library: ไม่ดาวน์โหลด
+            "--root-path", tmpdir,                 # โฟลเดอร์ว่าง -> ไม่มีอะไรให้ตรวจ
+            "--disable-song-archive", "True",      # ไม่ไปอ่าน archive เดิม
+            "--print-splash", "False",
+        ]
+        cmd = list(self.zotify_cmd) + args
+
+        self.log("\n=== ล็อกอิน Spotify ===")
+        self.log("กำลังขอลิงก์ล็อกอิน… เบราว์เซอร์จะเปิดให้อัตโนมัติ")
+        self.log("ถ้าไม่เปิดเอง ให้ก๊อปลิงก์ที่ขึ้นด้านล่างไปวางในเบราว์เซอร์")
+        self._begin_run(stoppable=True)
+        threading.Thread(target=self._run, args=(cmd, "login"), daemon=True).start()
+
+    def _maybe_open_oauth(self, line: str):
+        """ดัก URL ล็อกอินจาก log แล้วเปิดเบราว์เซอร์ให้ (ครั้งเดียว)."""
+        if getattr(self, "_oauth_opened", False):
+            return
+        m = OAUTH_URL_RE.search(line)
+        if not m:
+            return
+        url = m.group(0).rstrip('".,)')
+        self._oauth_opened = True
+        self._oauth_url = url
+        self.log("→ เปิดเบราว์เซอร์เพื่อล็อกอิน…")
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            self.log(f"  เปิดเบราว์เซอร์อัตโนมัติไม่ได้ ({e}) — ก๊อปลิงก์ด้านบนไปเปิดเองได้")
+
     def check_version(self):
         if self._busy():
             return
@@ -516,6 +597,7 @@ class App(tk.Tk):
     # ---------------- shared subprocess runner ----------------
     def _begin_run(self, stoppable: bool):
         self.run_btn.config(state="disabled")
+        self.login_btn.config(state="disabled")
         self.ver_btn.config(state="disabled")
         self.upgrade_btn.config(state="disabled")
         self.stop_btn.config(state="normal" if stoppable else "disabled")
@@ -538,9 +620,26 @@ class App(tk.Tk):
                 stdin=subprocess.DEVNULL, text=True, bufsize=1, env=env,
             )
             for line in self.proc.stdout:
-                self.log(line.rstrip("\n"))
+                line = line.rstrip("\n")
+                self.log(line)
+                if mode == "login":
+                    self._maybe_open_oauth(line)
             self.proc.wait()
             rc = self.proc.returncode
+
+            if mode == "login":
+                cred = zotify_credentials_path()
+                if cred.exists():
+                    self.log(f"\n✓ ล็อกอินสำเร็จ — บันทึกไว้ที่ {cred}")
+                    self.log("  ตอนนี้กด 'เริ่มดาวน์โหลด' ได้เลย ไม่ต้องล็อกอินอีก")
+                else:
+                    self.log("\n✗ ยังไม่พบไฟล์ credentials — ล็อกอินอาจไม่สำเร็จ")
+                    if getattr(self, "_oauth_url", None):
+                        self.log(f"  ลองเปิดลิงก์นี้เองอีกครั้ง:\n  {self._oauth_url}")
+                    else:
+                        self.log("  ไม่พบลิงก์ล็อกอินใน log — ลองรัน zotify ในเทอร์มินัลดูข้อความเต็ม")
+                return
+
             self.log(f"[เสร็จสิ้น] exit code = {rc}")
             if mode == "download" and rc != 0:
                 self.log("ถ้า error เรื่องล็อกอิน: ลองรัน `zotify <url>` ในเทอร์มินัลครั้งแรกเพื่อล็อกอิน แล้วกลับมาใช้ GUI")
@@ -559,6 +658,7 @@ class App(tk.Tk):
 
     def _on_done(self):
         self.run_btn.config(state="normal")
+        self.login_btn.config(state="normal")
         self.ver_btn.config(state="normal")
         self.upgrade_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
